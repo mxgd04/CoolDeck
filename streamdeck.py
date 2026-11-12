@@ -5,23 +5,22 @@ import time
 import sys
 import os
 import ctypes
-from ctypes import cast, POINTER, c_float, c_bool
+from ctypes import cast, POINTER
 import win32api
 import win32con
 import win32gui
 import win32process
 
+# Evita UnicodeEncodeError (✓, —, tildes) si la salida no es una consola UTF-8
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # ============================================================
 #  INSTALACIÓN:
-#  pip install pyserial pycaw comtypes pyautogui pywin32
+#  pip install pyserial pycaw comtypes pywin32
 # ============================================================
-
-try:
-    import pyautogui
-    pyautogui.FAILSAFE = False
-    PYAUTOGUI_OK = True
-except ImportError:
-    PYAUTOGUI_OK = False
 
 
 # ============================================================
@@ -30,8 +29,7 @@ except ImportError:
 # ============================================================
 # GUIDs necesarios
 import comtypes
-from comtypes import GUID, COMMETHOD, HRESULT
-from comtypes.client import CreateObject
+from comtypes import GUID
 
 CLSID_MMDeviceEnumerator = GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
 IID_IMMDeviceEnumerator  = GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
@@ -75,34 +73,7 @@ def toggle_mic():
             return
         except Exception as e:
             print(f"  [MIC] SetMute error: {e}")
-    # Fallback: PowerShell para mutear el mic sin Win+Alt+K
-    mic_muted = not mic_muted
-    state = "true" if mic_muted else "false"
-    subprocess.Popen([
-        "powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command",
-        f"""
-        Add-Type -TypeDefinition @'
-        using System.Runtime.InteropServices;
-        [Guid("5CDF2C82-841E-4546-9722-0CF74078229A")]
-        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        interface IAudioEndpointVolume {{
-            int f(); int g(); int h(); int i();
-            int SetMasterVolumeLevelScalar(float f, System.Guid g);
-            int j();
-            int GetMasterVolumeLevelScalar(out float f);
-            int SetMute([MarshalAs(UnmanagedType.Bool)] bool b, System.Guid g);
-            int GetMute([MarshalAs(UnmanagedType.Bool)] out bool b);
-        }}
-        [Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
-        [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        interface IMMDeviceEnumerator {{
-            int f();
-            int GetDefaultAudioEndpoint(int dataFlow, int role, out System.IntPtr ppDevice);
-        }}
-        '@ -ErrorAction SilentlyContinue
-        """,
-    ], creationflags=subprocess.CREATE_NO_WINDOW)
-    print(f"  [MIC] {'MUTEADO' if mic_muted else 'ACTIVO'} (fallback PS)")
+    print("  [MIC] No se pudo cambiar el estado del micrófono")
 
 
 # ============================================================
@@ -223,14 +194,16 @@ def open_terminal():
     subprocess.Popen(["wt"])
     print("  [TERMINAL] Abriendo")
 
-def take_screenshot():
-    win32api.keybd_event(win32con.VK_LWIN, 0, 0, 0)
-    win32api.keybd_event(win32con.VK_SHIFT, 0, 0, 0)
-    win32api.keybd_event(ord('S'), 0, 0, 0)
+def press_hotkey(*keys):
+    """Pulsa una combinación de teclas (códigos VK) y la suelta en orden inverso"""
+    for k in keys:
+        win32api.keybd_event(k, 0, 0, 0)
     time.sleep(0.05)
-    win32api.keybd_event(ord('S'), 0, win32con.KEYEVENTF_KEYUP, 0)
-    win32api.keybd_event(win32con.VK_SHIFT, 0, win32con.KEYEVENTF_KEYUP, 0)
-    win32api.keybd_event(win32con.VK_LWIN, 0, win32con.KEYEVENTF_KEYUP, 0)
+    for k in reversed(keys):
+        win32api.keybd_event(k, 0, win32con.KEYEVENTF_KEYUP, 0)
+
+def take_screenshot():
+    press_hotkey(win32con.VK_LWIN, win32con.VK_SHIFT, ord('S'))
     print("  [CAPTURA] Herramienta de recorte abierta")
 
 def open_browser():
@@ -238,8 +211,39 @@ def open_browser():
     print("  [NAVEGADOR] Abriendo")
 
 def monitor_off():
-    ctypes.windll.user32.SendMessageW(0xFFFF, 0x0112, 0xF170, 2)
+    # PostMessage (no SendMessage): SendMessage a HWND_BROADCAST se queda
+    # bloqueado si alguna ventana no responde.
+    ctypes.windll.user32.PostMessageW(0xFFFF, 0x0112, 0xF170, 2)
     print("  [MONITOR] Apagando pantalla")
+
+
+# ============================================================
+#  PÁGINA 2
+# ============================================================
+def volume_mute():
+    press_media_key(0xAD)  # VK_VOLUME_MUTE
+    print("  [VOL] Silenciar/Activar")
+
+def open_explorer():
+    subprocess.Popen(["explorer"])
+    print("  [EXPLORADOR] Abriendo")
+
+def open_task_manager():
+    # Ctrl+Shift+Esc: evita el error de elevación (UAC) de lanzar taskmgr.exe con Popen
+    press_hotkey(win32con.VK_CONTROL, win32con.VK_SHIFT, win32con.VK_ESCAPE)
+    print("  [TAREAS] Abriendo administrador de tareas")
+
+def show_desktop():
+    press_hotkey(win32con.VK_LWIN, ord('D'))
+    print("  [ESCRITORIO] Mostrar/ocultar")
+
+def lock_pc():
+    ctypes.windll.user32.LockWorkStation()
+    print("  [BLOQUEAR] PC bloqueado")
+
+def open_settings():
+    os.startfile("ms-settings:")
+    print("  [AJUSTES] Abriendo")
 
 
 # ============================================================
@@ -258,6 +262,13 @@ COMMANDS = {
     "CMD:OPEN_BROWSER":  open_browser,
     "CMD:OPEN_TERMINAL": open_terminal,
     "CMD:MONITOR_OFF":   monitor_off,
+    # Página 2
+    "CMD:VOL_MUTE":      volume_mute,
+    "CMD:OPEN_EXPLORER": open_explorer,
+    "CMD:TASK_MANAGER":  open_task_manager,
+    "CMD:SHOW_DESKTOP":  show_desktop,
+    "CMD:LOCK_PC":       lock_pc,
+    "CMD:OPEN_SETTINGS": open_settings,
 }
 
 
@@ -266,6 +277,9 @@ COMMANDS = {
 # ============================================================
 def find_esp32_port():
     ports = serial.tools.list_ports.comports()
+    for port in ports:
+        if port.vid == 0x303A:  # Espressif (USB nativo de la ESP32-S3)
+            return port.device
     for port in ports:
         desc = port.description.lower()
         if any(x in desc for x in ["cp210", "ch340", "ch9102", "usb serial", "uart", "cdc"]):
@@ -316,14 +330,23 @@ def main():
                 print(f"  [AVISO] Comando no reconocido: {line}")
 
         except serial.SerialException:
-            print("\n[ERROR] Conexión perdida. Reconectando en 3s...")
-            time.sleep(3)
+            print("\n[ERROR] Conexión perdida. Reintentando cada 3s (Ctrl+C para salir)...")
             try:
-                ser = serial.Serial(port, 115200, timeout=1)
-                print("Reconectado ✓")
-            except:
-                print("No se pudo reconectar.")
-                sys.exit(1)
+                ser.close()
+            except Exception:
+                pass
+            # La ESP32 puede tardar en volver a aparecer (p. ej. tras subir firmware)
+            # y a veces con otro número de COM, así que se reintenta sin límite.
+            while True:
+                time.sleep(3)
+                try:
+                    new_port = find_esp32_port() or port
+                    ser = serial.Serial(new_port, 115200, timeout=1)
+                    port = new_port
+                    print(f"Reconectado a {port} ✓")
+                    break
+                except serial.SerialException:
+                    pass
 
         except KeyboardInterrupt:
             print("\n\nCerrando CoolDeck...")
@@ -331,4 +354,7 @@ def main():
             sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nCerrando CoolDeck...")

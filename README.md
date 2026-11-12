@@ -57,7 +57,7 @@ display and touch controller share the same SPI peripheral on the S3.
 ## Touch Calibration
 
 The touch controller is pre-calibrated for this specific panel with the
-following raw ADC values (set in `src/main.cpp`):
+following raw ADC values (set in `main.cpp`):
 
 ```cpp
 cfg.x_min = 438;
@@ -90,7 +90,12 @@ and adjust these four values accordingly.
 
 ## Stream Deck layout
 
-12 buttons arranged in a 3x4 grid (landscape, 480x320):
+The deck has **multiple pages** of 12 buttons (3x4 grid, landscape 480x320).
+**Swipe left/right** anywhere on the screen to change page; the dots in the
+top-right corner show the current page. Buttons fire when you **lift your
+finger**, so a swipe that starts on a button doesn't trigger it.
+
+### Page 1
 
 | | Col 1 | Col 2 | Col 3 |
 |---|---|---|---|
@@ -99,6 +104,22 @@ and adjust these four values accordingly.
 | **Row 3** | Volume down | Volume up | Screenshot |
 | **Row 4** | Open browser | Open terminal | Turn off monitor |
 
+### Page 2
+
+| | Col 1 | Col 2 | Col 3 |
+|---|---|---|---|
+| **Row 1** | System mute | File explorer | Task manager |
+| **Row 2** | Show desktop | Lock PC | Windows settings |
+| **Row 3** | *(empty)* | *(empty)* | *(empty)* |
+| **Row 4** | *(empty)* | *(empty)* | *(empty)* |
+
+### Adding buttons or pages
+
+1. In `main.cpp`, edit the `PAGES` array: each entry is
+   `{ label, sublabel, color, icon, "CMD:NAME", isToggle }`. Use `EMPTY` for
+   unused slots, or add a new block of 12 entries for another page.
+2. In `streamdeck.py`, add a function and register `"CMD:NAME"` in `COMMANDS`.
+
 Each button press sends a text command over USB Serial (e.g.
 `CMD:MIC_TOGGLE`, `CMD:SPOTIFY_PLAY`, `CMD:VOL_UP`...).
 
@@ -106,13 +127,12 @@ Each button press sends a text command over USB Serial (e.g.
 
 ## PC bridge (Windows)
 
-The `streamdeck_bridge.py` script (companion repo file, not included in this
-firmware folder) listens on the ESP32's serial port and executes the
+The `streamdeck.py` script listens on the ESP32's serial port and executes the
 corresponding actions on a Windows PC:
 
 - **Mic mute** via `pycaw` (system default microphone)
-- **Discord mute** via Discord's local IPC (`SET_VOICE_SETTINGS`), works
-  without focusing the Discord window
+- **Discord mute** by briefly focusing the Discord window and sending its
+  default `Ctrl+Shift+M` shortcut, then restoring the previous window
 - **Spotify controls** via global media keys
 - **System volume** via global media keys
 - **Screenshot** via `Win+Shift+S`
@@ -120,12 +140,12 @@ corresponding actions on a Windows PC:
 
 ### Requirements
 ```bash
-pip install pyserial pycaw comtypes pyautogui pywin32
+pip install pyserial pycaw comtypes pywin32
 ```
 
 Run it with:
 ```bash
-python streamdeck_bridge.py
+python streamdeck.py
 ```
 
 It auto-detects the ESP32's serial port (CP210x/CH9102/USB CDC).
