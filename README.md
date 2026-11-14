@@ -125,8 +125,10 @@ are sent by `streamdeck.py` every second as
 - **GPU / VRAM:** `nvidia-smi` (NVIDIA cards only)
 - **CPU temperature:** Windows doesn't expose it to normal programs, so keep
   [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
-  open **as administrator**. The bridge reads it through WMI. Without it the
-  screen shows `--`.
+  open **as administrator** (`winget install LibreHardwareMonitor.LibreHardwareMonitor`)
+  and enable **Options > Remote Web Server > Run** (port 8085). The bridge reads
+  `http://localhost:8085/data.json`. Enable **Run on Windows Startup** so it's
+  always available. Without it the screen shows `--`.
 
 ### Adding buttons or pages
 

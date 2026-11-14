@@ -285,13 +285,55 @@ except ImportError:
     print("[AVISO] psutil no instalado: pip install psutil (sin datos de CPU/RAM/red)")
 
 
+LHM_URL = "http://localhost:8085/data.json"
+CPU_TEMP_NAMES = ("CPU Package", "Core (Tctl/Tdie)", "Core (Tctl)")
+
+
+def read_cpu_temp_lhm_web():
+    """Lee la temperatura de la CPU del servidor web de LibreHardwareMonitor"""
+    import json
+    import re
+    import urllib.request
+    try:
+        with urllib.request.urlopen(LHM_URL, timeout=1) as r:
+            root = json.load(r)
+    except Exception:
+        return None
+
+    found = {}  # nombre -> ºC, solo sensores de temperatura de la CPU
+
+    def walk(node, in_cpu):
+        sid = node.get("SensorId", "")
+        in_cpu = in_cpu or "cpu" in node.get("ImageURL", "").lower() or "cpu/" in sid
+        val = node.get("Value", "")
+        if in_cpu and "°C" in val:
+            m = re.search(r"-?\d+(?:[.,]\d+)?", val)
+            if m:
+                found[node.get("Text", "")] = float(m.group().replace(",", "."))
+        for ch in node.get("Children", []):
+            walk(ch, in_cpu)
+
+    walk(root, False)
+    for name in CPU_TEMP_NAMES:
+        if name in found:
+            return found[name]
+    cores = [v for n, v in found.items() if n.startswith("CPU Core") or n.startswith("Core")]
+    return max(cores) if cores else None
+
+
 def read_cpu_temp():
     """Temperatura de la CPU en ºC, o None.
 
-    Windows no la expone sin privilegios, así que se lee del WMI de
-    LibreHardwareMonitor (u OpenHardwareMonitor) si está abierto.
+    Windows no la expone sin privilegios, así que se lee de
+    LibreHardwareMonitor si está abierto:
+      1) su servidor web (Opciones > Servidor web remoto), versiones actuales
+      2) su WMI (solo versiones antiguas / OpenHardwareMonitor)
     Como último recurso prueba la zona térmica ACPI (requiere admin).
     """
+    t = read_cpu_temp_lhm_web()
+    if t is not None:
+        return t
+
     import win32com.client
     for ns in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
         try:
@@ -301,7 +343,7 @@ def read_cpu_temp():
                 if s.Value is not None]
             # Preferimos "CPU Package" (Intel) o "Core (Tctl/Tdie)" (AMD)
             for name, val in temps:
-                if name in ("CPU Package", "Core (Tctl/Tdie)", "Core (Tctl)"):
+                if name in CPU_TEMP_NAMES:
                     return val
             cores = [v for n, v in temps if n.startswith("CPU Core") or n.startswith("Core #")]
             if cores:
@@ -341,7 +383,8 @@ def stats_loop(get_serial):
     cpu_temp_ok = read_cpu_temp() is not None
     if not cpu_temp_ok:
         print("[INFO] Temperatura de CPU no disponible: abre LibreHardwareMonitor "
-              "(como administrador) para verla en la pantalla.")
+              "como administrador y activa Opciones > Servidor web remoto > Ejecutar "
+              "(puerto 8085) para verla en la pantalla.")
 
     last_net = psutil.net_io_counters() if psutil else None
     last_t = time.time()
