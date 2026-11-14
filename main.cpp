@@ -167,10 +167,34 @@ const Button PAGES[][NUM_BUTTONS] = {
   },
 };
 
-const int NUM_PAGES = sizeof(PAGES) / sizeof(PAGES[0]);
+const int NUM_BTN_PAGES = sizeof(PAGES) / sizeof(PAGES[0]);
+const int INFO_PAGE     = 0;                   // la página de info va a la izquierda del todo
+const int NUM_PAGES     = NUM_BTN_PAGES + 1;
 
-int  currentPage = 0;
-bool toggleState[NUM_PAGES][NUM_BUTTONS] = {};
+int  currentPage = 1;                          // se arranca en la primera página de botones
+bool toggleState[NUM_BTN_PAGES][NUM_BUTTONS] = {};
+
+inline bool onInfoPage() { return currentPage == INFO_PAGE; }
+inline int  btnPage()    { return currentPage - 1; }  // índice en PAGES / toggleState
+
+// ============================================================
+//  ESTADÍSTICAS DEL PC (las envía streamdeck.py por serie)
+//  Formato: "STAT:cpu=23,ctemp=45,ram=61,ramu=9.8,ramt=16,..."
+//  Un valor < 0 significa "no disponible".
+// ============================================================
+struct PcStats {
+  float cpu = -1, ctemp = -1;
+  float ram = -1, ramu = -1, ramt = -1;
+  float gpu = -1, gtemp = -1;
+  float vram = -1, vramu = -1, vramt = -1;
+  float up = -1, down = -1;           // KB/s
+} stats;
+
+uint32_t lastStatMs = 0;              // millis() del último STAT recibido (0 = nunca)
+bool     statsDirty = false;          // hay datos nuevos sin dibujar
+#define  STATS_TIMEOUT_MS 4000
+
+LGFX_Sprite infoSprite(&tft);         // buffer en PSRAM para redibujar sin parpadeo
 
 // ============================================================
 //  DIBUJO DE ICONOS
@@ -315,11 +339,12 @@ void drawIcon(int cx, int cy, uint8_t icon, uint16_t color, bool active) {
 // ============================================================
 //  GEOMETRÍA
 // ============================================================
-inline const Button& btn(int idx) { return PAGES[currentPage][idx]; }
+inline const Button& btn(int idx) { return PAGES[btnPage()][idx]; }
 inline bool isEmpty(int idx)      { return btn(idx).label == nullptr; }
 
 // Devuelve el índice del botón bajo (tx, ty) o -1
 int buttonAt(int32_t tx, int32_t ty) {
+  if (onInfoPage()) return -1;
   if (tx < MARGIN_X || ty < MARGIN_Y) return -1;
   int col = (tx - MARGIN_X) / (BTN_W + GAP);
   int row = (ty - MARGIN_Y) / (BTN_H + GAP);
@@ -349,7 +374,7 @@ void drawButton(int idx, bool pressed) {
   }
 
   const Button& b = btn(idx);
-  bool active = toggleState[currentPage][idx];
+  bool active = toggleState[btnPage()][idx];
   uint16_t bgColor = pressed ? C_BTN_PR : C_BTN;
 
   tft.fillRoundRect(x, y, BTN_W, BTN_H, 8, bgColor);
@@ -397,11 +422,14 @@ void drawHeader() {
 // ============================================================
 //  DIBUJA TODO EL DECK
 // ============================================================
+void drawInfoPage();
+
 void drawDeck() {
   tft.startWrite();
   tft.fillScreen(C_BG);
   drawHeader();
-  for (int i = 0; i < NUM_BUTTONS; i++) drawButton(i, false);
+  if (onInfoPage()) drawInfoPage();
+  else for (int i = 0; i < NUM_BUTTONS; i++) drawButton(i, false);
   tft.endWrite();
 }
 
@@ -413,13 +441,211 @@ void changePage(int delta) {
 }
 
 // ============================================================
+//  PÁGINA DE INFORMACIÓN (CPU / GPU / RAM / VRAM / RED)
+// ============================================================
+#define INFO_Y   (HEADER_H + 4)
+#define INFO_H   (SCREEN_H - INFO_Y)
+#define C_CARD   0x18C3
+#define C_TRACK  0x3186
+
+// Verde / naranja / rojo según el valor
+uint16_t levelColor(float v, float warn, float crit) {
+  if (v >= crit) return C_RED;
+  if (v >= warn) return C_ORANGE;
+  return C_GREEN;
+}
+
+void fmtVal(char* out, size_t n, float v, const char* suffix) {
+  if (v < 0) snprintf(out, n, "--%s", suffix);
+  else       snprintf(out, n, "%.0f%s", v, suffix);
+}
+
+// Tarjeta grande: indicador circular de uso + temperatura
+void drawGaugeCard(LGFX_Sprite& sp, int x, int y, int w, int h,
+                   const char* title, uint16_t accent, float usage, float temp) {
+  sp.fillRoundRect(x, y, w, h, 10, C_CARD);
+  sp.setTextDatum(TL_DATUM);
+  sp.setTextSize(2);
+  sp.setTextColor(accent);
+  sp.drawString(title, x + 12, y + 10);
+
+  int cx = x + 78, cy = y + h / 2 + 12, r = 52;
+  // Arco de 270°, de 135° a 45° (0° = derecha, sentido horario)
+  sp.fillArc(cx, cy, r, r - 10, 135, 45, C_TRACK);
+  if (usage > 0) {
+    float end = 135 + 270.0f * min(usage, 100.0f) / 100.0f;
+    if (end >= 360) end -= 360;
+    sp.fillArc(cx, cy, r, r - 10, 135, end, levelColor(usage, 70, 90));
+  }
+  char buf[16];
+  fmtVal(buf, sizeof(buf), usage, "%");
+  sp.setTextDatum(MC_DATUM);
+  sp.setTextColor(C_TEXT);
+  sp.setTextSize(3);
+  sp.drawString(buf, cx, cy);
+  sp.setTextSize(1);
+  sp.setTextColor(C_GREY);
+  sp.drawString("USO", cx, cy + 22);
+
+  // Temperatura a la derecha
+  int tx = x + w - 44;
+  sp.drawString("TEMP", tx, cy - 26);
+  fmtVal(buf, sizeof(buf), temp, "");
+  sp.setTextSize(3);
+  sp.setTextColor(temp < 0 ? C_GREY : levelColor(temp, 70, 85));
+  sp.drawString(buf, tx, cy);
+  if (temp >= 0) {
+    sp.setTextSize(1);
+    sp.drawString("C", tx, cy + 22);
+  }
+}
+
+// Tarjeta pequeña con barra horizontal
+void drawBarCard(LGFX_Sprite& sp, int x, int y, int w, int h,
+                 const char* title, uint16_t accent, float pct, float used, float total) {
+  sp.fillRoundRect(x, y, w, h, 10, C_CARD);
+  sp.setTextDatum(TL_DATUM);
+  sp.setTextSize(2);
+  sp.setTextColor(accent);
+  sp.drawString(title, x + 10, y + 10);
+
+  char buf[24];
+  fmtVal(buf, sizeof(buf), pct, "%");
+  sp.setTextDatum(TR_DATUM);
+  sp.setTextColor(C_TEXT);
+  sp.setTextSize(3);
+  sp.drawString(buf, x + w - 10, y + 36);
+
+  int bx = x + 10, by = y + h - 40, bw = w - 20, bh = 10;
+  sp.fillRoundRect(bx, by, bw, bh, 5, C_TRACK);
+  if (pct > 0) {
+    int fw = max(bh, (int)(bw * min(pct, 100.0f) / 100.0f));
+    sp.fillRoundRect(bx, by, fw, bh, 5, levelColor(pct, 75, 90));
+  }
+
+  if (used >= 0 && total > 0) snprintf(buf, sizeof(buf), "%.1f / %.0f GB", used, total);
+  else                        snprintf(buf, sizeof(buf), "-- GB");
+  sp.setTextDatum(TL_DATUM);
+  sp.setTextSize(1);
+  sp.setTextColor(C_GREY);
+  sp.drawString(buf, bx, by + 16);
+}
+
+void fmtRate(char* out, size_t n, float kbs) {
+  if (kbs < 0)          snprintf(out, n, "--");
+  else if (kbs >= 1024) snprintf(out, n, "%.1f MB/s", kbs / 1024);
+  else                  snprintf(out, n, "%.0f KB/s", kbs);
+}
+
+void drawNetCard(LGFX_Sprite& sp, int x, int y, int w, int h) {
+  sp.fillRoundRect(x, y, w, h, 10, C_CARD);
+  sp.setTextDatum(TL_DATUM);
+  sp.setTextSize(2);
+  sp.setTextColor(C_ICON);
+  sp.drawString("RED", x + 10, y + 10);
+
+  char buf[20];
+  int ly = y + 46;
+  sp.fillTriangle(x + 12, ly, x + 24, ly, x + 18, ly + 10, C_GREEN);        // bajada
+  fmtRate(buf, sizeof(buf), stats.down);
+  sp.setTextColor(C_TEXT);
+  sp.drawString(buf, x + 32, ly - 2);
+  ly += 36;
+  sp.fillTriangle(x + 12, ly + 10, x + 24, ly + 10, x + 18, ly, C_ORANGE);  // subida
+  fmtRate(buf, sizeof(buf), stats.up);
+  sp.drawString(buf, x + 32, ly - 2);
+}
+
+bool statsStale() {
+  return lastStatMs == 0 || millis() - lastStatMs > STATS_TIMEOUT_MS;
+}
+
+void drawInfoPage() {
+  LGFX_Sprite& sp = infoSprite;
+  if (!sp.getBuffer()) {
+    sp.setPsram(true);
+    sp.setColorDepth(16);
+    if (!sp.createSprite(SCREEN_W, INFO_H)) {
+      Serial.println("ERROR: no se pudo crear el sprite de info");
+      return;
+    }
+  }
+  sp.fillSprite(C_BG);
+
+  const int m = 8, gap = 8, topH = 158;
+  int halfW = (SCREEN_W - m * 2 - gap) / 2;
+  drawGaugeCard(sp, m,               0, halfW, topH, "CPU", C_ICON,  stats.cpu, stats.ctemp);
+  drawGaugeCard(sp, m + halfW + gap, 0, halfW, topH, "GPU", C_GREEN, stats.gpu, stats.gtemp);
+
+  int by = topH + gap, bh = INFO_H - by - m;
+  int thirdW = (SCREEN_W - m * 2 - gap * 2) / 3;
+  drawBarCard(sp, m,                      by, thirdW, bh, "RAM",  C_PURPLE, stats.ram,  stats.ramu,  stats.ramt);
+  drawBarCard(sp, m + (thirdW + gap),     by, thirdW, bh, "VRAM", C_YELLOW, stats.vram, stats.vramu, stats.vramt);
+  drawNetCard(sp, m + (thirdW + gap) * 2, by, thirdW, bh);
+
+  if (statsStale()) {
+    sp.fillRoundRect(SCREEN_W / 2 - 130, topH / 2 - 18, 260, 36, 8, C_RED);
+    sp.setTextDatum(MC_DATUM);
+    sp.setTextSize(2);
+    sp.setTextColor(C_TEXT);
+    sp.drawString("Sin datos del PC", SCREEN_W / 2, topH / 2);
+  }
+
+  sp.pushSprite(0, INFO_Y);
+}
+
+// ============================================================
+//  LECTURA DE DATOS POR SERIE (PC -> ESP32)
+// ============================================================
+void parseStats(char* line) {
+  for (char* tok = strtok(line, ","); tok; tok = strtok(nullptr, ",")) {
+    char* eq = strchr(tok, '=');
+    if (!eq) continue;
+    *eq = 0;
+    float v = atof(eq + 1);
+    if      (!strcmp(tok, "cpu"))   stats.cpu   = v;
+    else if (!strcmp(tok, "ctemp")) stats.ctemp = v;
+    else if (!strcmp(tok, "ram"))   stats.ram   = v;
+    else if (!strcmp(tok, "ramu"))  stats.ramu  = v;
+    else if (!strcmp(tok, "ramt"))  stats.ramt  = v;
+    else if (!strcmp(tok, "gpu"))   stats.gpu   = v;
+    else if (!strcmp(tok, "gtemp")) stats.gtemp = v;
+    else if (!strcmp(tok, "vram"))  stats.vram  = v;
+    else if (!strcmp(tok, "vramu")) stats.vramu = v;
+    else if (!strcmp(tok, "vramt")) stats.vramt = v;
+    else if (!strcmp(tok, "up"))    stats.up    = v;
+    else if (!strcmp(tok, "down"))  stats.down  = v;
+  }
+  lastStatMs = millis() | 1;  // nunca 0 (0 = "nunca recibido")
+  statsDirty = true;
+}
+
+void readSerial() {
+  static char buf[256];
+  static size_t len = 0;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      buf[len] = 0;
+      if (strncmp(buf, "STAT:", 5) == 0) parseStats(buf + 5);
+      len = 0;
+    } else if (len < sizeof(buf) - 1) {
+      buf[len++] = c;
+    } else {
+      len = 0;  // línea demasiado larga: se descarta
+    }
+  }
+}
+
+// ============================================================
 //  ACCIÓN AL PULSAR UN BOTÓN
 // ============================================================
 void onButtonPress(int idx) {
   const Button& b = btn(idx);
   Serial.printf("\n>>> P%d BOTON %d pulsado: %s\n", currentPage + 1, idx, b.label);
 
-  if (b.toggle) toggleState[currentPage][idx] = !toggleState[currentPage][idx];
+  if (b.toggle) toggleState[btnPage()][idx] = !toggleState[btnPage()][idx];
   if (b.cmd)    Serial.println(b.cmd);
 }
 
@@ -450,7 +676,23 @@ int     pressedBtn   = -1;
 uint8_t releaseCount = 0;
 int32_t startX, startY, lastX, lastY;
 
+bool wasStale = true;
+
 void loop() {
+  readSerial();
+
+  // Redibuja la página de info con datos nuevos o cuando caducan (no mientras se toca)
+  if (onInfoPage() && !touchActive) {
+    bool stale = statsStale();
+    if (statsDirty || stale != wasStale) {
+      statsDirty = false;
+      wasStale   = stale;
+      tft.startWrite();
+      drawInfoPage();
+      tft.endWrite();
+    }
+  }
+
   int32_t tx, ty;
   bool touching = tft.getTouch(&tx, &ty);
 

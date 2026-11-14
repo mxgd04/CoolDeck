@@ -5,6 +5,7 @@ import time
 import sys
 import os
 import ctypes
+import threading
 from ctypes import cast, POINTER
 import win32api
 import win32con
@@ -19,7 +20,7 @@ except Exception:
 
 # ============================================================
 #  INSTALACIÓN:
-#  pip install pyserial pycaw comtypes pywin32
+#  pip install pyserial pycaw comtypes pywin32 psutil
 # ============================================================
 
 
@@ -273,6 +274,128 @@ COMMANDS = {
 
 
 # ============================================================
+#  ESTADÍSTICAS DEL PC -> PÁGINA DE INFO DE LA ESP32
+# ============================================================
+STATS_INTERVAL = 1.0  # segundos entre envíos
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
+    print("[AVISO] psutil no instalado: pip install psutil (sin datos de CPU/RAM/red)")
+
+
+def read_cpu_temp():
+    """Temperatura de la CPU en ºC, o None.
+
+    Windows no la expone sin privilegios, así que se lee del WMI de
+    LibreHardwareMonitor (u OpenHardwareMonitor) si está abierto.
+    Como último recurso prueba la zona térmica ACPI (requiere admin).
+    """
+    import win32com.client
+    for ns in ("root\\LibreHardwareMonitor", "root\\OpenHardwareMonitor"):
+        try:
+            svc = win32com.client.GetObject(f"winmgmts:{ns}")
+            temps = [(s.Name, float(s.Value)) for s in svc.ExecQuery(
+                "SELECT Name, Value FROM Sensor WHERE SensorType='Temperature'")
+                if s.Value is not None]
+            # Preferimos "CPU Package" (Intel) o "Core (Tctl/Tdie)" (AMD)
+            for name, val in temps:
+                if name in ("CPU Package", "Core (Tctl/Tdie)", "Core (Tctl)"):
+                    return val
+            cores = [v for n, v in temps if n.startswith("CPU Core") or n.startswith("Core #")]
+            if cores:
+                return max(cores)
+        except Exception:
+            pass
+    try:
+        svc = win32com.client.GetObject("winmgmts:root\\wmi")
+        for z in svc.InstancesOf("MSAcpi_ThermalZoneTemperature"):
+            return z.CurrentTemperature / 10.0 - 273.15
+    except Exception:
+        pass
+    return None
+
+
+def read_nvidia_gpu():
+    """(uso %, temp ºC, VRAM usada MB, VRAM total MB) o None"""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=3,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        ).stdout.strip().splitlines()[0]
+        return tuple(float(x) for x in out.split(","))
+    except Exception:
+        return None
+
+
+def stats_loop(get_serial):
+    """Hilo que envía 'STAT:...' a la ESP32 cada STATS_INTERVAL segundos"""
+    import pythoncom
+    pythoncom.CoInitialize()  # necesario para WMI desde un hilo
+
+    have_nvidia = read_nvidia_gpu() is not None
+    cpu_temp_ok = read_cpu_temp() is not None
+    if not cpu_temp_ok:
+        print("[INFO] Temperatura de CPU no disponible: abre LibreHardwareMonitor "
+              "(como administrador) para verla en la pantalla.")
+
+    last_net = psutil.net_io_counters() if psutil else None
+    last_t = time.time()
+    if psutil:
+        psutil.cpu_percent(None)  # la primera lectura siempre da 0
+
+    temp_check = 0
+    while True:
+        time.sleep(STATS_INTERVAL)
+        fields = {}
+
+        if psutil:
+            fields["cpu"] = psutil.cpu_percent(None)
+            vm = psutil.virtual_memory()
+            fields["ram"] = vm.percent
+            fields["ramu"] = vm.used / 1024**3
+            fields["ramt"] = vm.total / 1024**3
+
+            now = time.time()
+            net = psutil.net_io_counters()
+            dt = max(now - last_t, 0.001)
+            fields["down"] = (net.bytes_recv - last_net.bytes_recv) / 1024 / dt
+            fields["up"] = (net.bytes_sent - last_net.bytes_sent) / 1024 / dt
+            last_net, last_t = net, now
+
+        # Si no había temperatura, reintenta cada 10 s (por si abren LHM después)
+        t = None
+        if cpu_temp_ok or temp_check <= 0:
+            t = read_cpu_temp()
+            cpu_temp_ok = t is not None
+            temp_check = 10
+        else:
+            temp_check -= 1
+        fields["ctemp"] = t if t is not None else -1
+
+        if have_nvidia:
+            gpu = read_nvidia_gpu()
+            if gpu:
+                util, gtemp, vused, vtotal = gpu
+                fields.update(gpu=util, gtemp=gtemp,
+                              vram=vused / vtotal * 100 if vtotal else -1,
+                              vramu=vused / 1024, vramt=vtotal / 1024)
+
+        line = "STAT:" + ",".join(f"{k}={v:.1f}" for k, v in fields.items()) + "\n"
+        ser = get_serial()
+        if ser is None:
+            continue
+        try:
+            ser.write(line.encode("ascii"))
+        except Exception:
+            pass  # el bucle principal se encarga de reconectar
+
+
+# ============================================================
 #  BUSCAR PUERTO ESP32
 # ============================================================
 def find_esp32_port():
@@ -313,6 +436,10 @@ def main():
         print(f"Error al abrir {port}: {e}")
         sys.exit(1)
 
+    # El hilo de estadísticas lee siempre el puerto actual (cambia al reconectar)
+    current = {"ser": ser}
+    threading.Thread(target=stats_loop, args=(lambda: current["ser"],), daemon=True).start()
+
     while True:
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -331,6 +458,7 @@ def main():
 
         except serial.SerialException:
             print("\n[ERROR] Conexión perdida. Reintentando cada 3s (Ctrl+C para salir)...")
+            current["ser"] = None
             try:
                 ser.close()
             except Exception:
@@ -343,6 +471,7 @@ def main():
                     new_port = find_esp32_port() or port
                     ser = serial.Serial(new_port, 115200, timeout=1)
                     port = new_port
+                    current["ser"] = ser
                     print(f"Reconectado a {port} ✓")
                     break
                 except serial.SerialException:

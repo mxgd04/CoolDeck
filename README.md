@@ -113,6 +113,21 @@ finger**, so a swipe that starts on a button doesn't trigger it.
 | **Row 3** | *(empty)* | *(empty)* | *(empty)* |
 | **Row 4** | *(empty)* | *(empty)* | *(empty)* |
 
+### Info page (leftmost page)
+
+The deck boots on Page 1; **swipe right** from there to reach the **PC monitor page**, showing CPU usage and
+temperature, GPU usage and temperature, RAM, VRAM and network speed. The values
+are sent by `streamdeck.py` every second as
+`STAT:cpu=23,ctemp=45,ram=61,...`. If no data arrives for 4 s, the screen shows
+"Sin datos del PC".
+
+- **CPU / RAM / network:** `psutil`
+- **GPU / VRAM:** `nvidia-smi` (NVIDIA cards only)
+- **CPU temperature:** Windows doesn't expose it to normal programs, so keep
+  [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)
+  open **as administrator**. The bridge reads it through WMI. Without it the
+  screen shows `--`.
+
 ### Adding buttons or pages
 
 1. In `main.cpp`, edit the `PAGES` array: each entry is
@@ -140,7 +155,7 @@ corresponding actions on a Windows PC:
 
 ### Requirements
 ```bash
-pip install pyserial pycaw comtypes pywin32
+pip install pyserial pycaw comtypes pywin32 psutil
 ```
 
 Run it with:
