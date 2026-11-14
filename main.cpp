@@ -174,6 +174,12 @@ const int NUM_PAGES     = NUM_BTN_PAGES + 1;
 int  currentPage = 1;                          // se arranca en la primera página de botones
 bool toggleState[NUM_BTN_PAGES][NUM_BUTTONS] = {};
 
+// Sincronización del estado real que manda el PC ("STATE:MIC_TOGGLE=1,...")
+bool     stateChanged[NUM_BTN_PAGES][NUM_BUTTONS] = {};  // pendiente de redibujar
+uint32_t lastPressMs[NUM_BTN_PAGES][NUM_BUTTONS]  = {};  // para ignorar estados viejos
+bool     anyStateChanged = false;
+#define  STATE_HOLD_MS 2000   // tras pulsar, se ignora el estado del PC durante este tiempo
+
 inline bool onInfoPage() { return currentPage == INFO_PAGE; }
 inline int  btnPage()    { return currentPage - 1; }  // índice en PAGES / toggleState
 
@@ -620,6 +626,30 @@ void parseStats(char* line) {
   statsDirty = true;
 }
 
+// "STATE:MIC_TOGGLE=1,VOL_MUTE=0" -> actualiza los botones cuyo cmd es "CMD:<clave>"
+void parseState(char* line) {
+  uint32_t now = millis();
+  for (char* tok = strtok(line, ","); tok; tok = strtok(nullptr, ",")) {
+    char* eq = strchr(tok, '=');
+    if (!eq) continue;
+    *eq = 0;
+    bool on = atoi(eq + 1) != 0;
+    for (int p = 0; p < NUM_BTN_PAGES; p++) {
+      for (int i = 0; i < NUM_BUTTONS; i++) {
+        const Button& b = PAGES[p][i];
+        if (!b.toggle || !b.cmd || strncmp(b.cmd, "CMD:", 4) || strcmp(b.cmd + 4, tok)) continue;
+        // Recién pulsado: el PC aún puede estar mandando el estado anterior
+        if (lastPressMs[p][i] && now - lastPressMs[p][i] < STATE_HOLD_MS) continue;
+        if (toggleState[p][i] != on) {
+          toggleState[p][i]  = on;
+          stateChanged[p][i] = true;
+          anyStateChanged    = true;
+        }
+      }
+    }
+  }
+}
+
 void readSerial() {
   static char buf[256];
   static size_t len = 0;
@@ -628,7 +658,8 @@ void readSerial() {
     if (c == '\r') continue;
     if (c == '\n') {
       buf[len] = 0;
-      if (strncmp(buf, "STAT:", 5) == 0) parseStats(buf + 5);
+      if      (strncmp(buf, "STAT:", 5) == 0)  parseStats(buf + 5);
+      else if (strncmp(buf, "STATE:", 6) == 0) parseState(buf + 6);
       len = 0;
     } else if (len < sizeof(buf) - 1) {
       buf[len++] = c;
@@ -645,7 +676,10 @@ void onButtonPress(int idx) {
   const Button& b = btn(idx);
   Serial.printf("\n>>> P%d BOTON %d pulsado: %s\n", currentPage + 1, idx, b.label);
 
-  if (b.toggle) toggleState[btnPage()][idx] = !toggleState[btnPage()][idx];
+  if (b.toggle) {
+    toggleState[btnPage()][idx] = !toggleState[btnPage()][idx];
+    lastPressMs[btnPage()][idx] = millis() | 1;
+  }
   if (b.cmd)    Serial.println(b.cmd);
 }
 
@@ -690,6 +724,19 @@ void loop() {
       tft.startWrite();
       drawInfoPage();
       tft.endWrite();
+    }
+  }
+
+  // Redibuja los botones cuyo estado real ha cambiado (los de otras páginas
+  // se verán bien al cambiar de página, porque drawDeck lee toggleState)
+  if (anyStateChanged && !touchActive) {
+    anyStateChanged = false;
+    for (int p = 0; p < NUM_BTN_PAGES; p++) {
+      for (int i = 0; i < NUM_BUTTONS; i++) {
+        if (!stateChanged[p][i]) continue;
+        stateChanged[p][i] = false;
+        if (p == btnPage()) drawButton(i, false);
+      }
     }
   }
 

@@ -167,6 +167,36 @@ python streamdeck.py
 
 It auto-detects the ESP32's serial port (CP210x/CH9102/USB CDC).
 
-If not, you can select the port manually when the program asks for it.
+If not, you can type the port manually, or press Enter to wait until the ESP32
+is plugged in.
+
+Only one bridge can run at a time; a second one exits with a warning instead of
+fighting over the COM port.
+
+### Real toggle state
+
+Every second the bridge also sends `STATE:MIC_TOGGLE=1,VOL_MUTE=0,...` so
+toggle buttons show the **real** state even if you change it from Windows:
+
+- **Mic** and **System mute**: read from the default audio devices
+- **Camera**: whether the Windows Camera app is open
+- **Play/Pause**: current media session (optional, needs
+  `pip install winrt-Windows.Media.Control winrt-Windows.Foundation`)
+- **Discord** can't be queried, so it still flips only when you tap it
+
+For 2 s after a tap the ESP ignores the PC's state for that button, so an old
+state can't make it flicker.
+
+### Start automatically with Windows (hidden)
+
+Put a shortcut in the Startup folder (`Win+R` → `shell:startup`) with:
+
+- **Target:** `pythonw.exe "<path>\streamdeck.py"`
+- **Start in:** the project folder
+
+With `pythonw` there's no console window; output goes to `streamdeck.log`.
+Before uploading firmware, run **`parar.bat`** to close it and free the COM
+port, then start it again from the shortcut (or `iniciar.bat` to see the
+console).
 
 ---

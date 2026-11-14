@@ -42,8 +42,8 @@ eConsole = 0
 
 mic_muted = False
 
-def get_mic_volume_interface():
-    """Devuelve el IAudioEndpointVolume del micrófono por defecto"""
+def get_mic_volume_interface(flow=eCapture, quiet=False):
+    """IAudioEndpointVolume del micro (eCapture) o altavoz (eRender) por defecto"""
     try:
         import comtypes.client
         # IMMDeviceEnumerator
@@ -55,11 +55,23 @@ def get_mic_volume_interface():
         from pycaw.pycaw import IMMDeviceEnumerator, IAudioEndpointVolume
         from comtypes import CLSCTX_ALL
         enumerator = enumerator.QueryInterface(IMMDeviceEnumerator)
-        mic_device = enumerator.GetDefaultAudioEndpoint(eCapture, eConsole)
+        mic_device = enumerator.GetDefaultAudioEndpoint(flow, eConsole)
         vol = mic_device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-        return cast(vol, POINTER(IAudioEndpointVolume))
+        # QueryInterface (no cast): cast duplica la referencia sin AddRef y
+        # se libera dos veces, lo que acaba en "access violation"
+        return vol.QueryInterface(IAudioEndpointVolume)
     except Exception as e:
-        print(f"  [MIC] get_mic_volume_interface error: {e}")
+        if not quiet:
+            print(f"  [MIC] get_mic_volume_interface error: {e}")
+        return None
+
+
+def get_mute(flow):
+    """True/False si el dispositivo por defecto está muteado, None si no se sabe"""
+    vol = get_mic_volume_interface(flow, quiet=True)
+    try:
+        return bool(vol.GetMute()) if vol else None
+    except Exception:
         return None
 
 def toggle_mic():
@@ -180,11 +192,20 @@ def spotify_prev():
 # ============================================================
 #  CÁMARA, TERMINAL, CAPTURA, NAVEGADOR, MONITOR
 # ============================================================
-camera_open = False
+def is_camera_open():
+    """True si la app Cámara de Windows está abierta, None si no se puede saber"""
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        return any((p.info["name"] or "").lower() == "windowscamera.exe"
+                   for p in psutil.process_iter(["name"]))
+    except Exception:
+        return None
+
 def toggle_camera():
-    global camera_open
-    camera_open = not camera_open
-    if camera_open:
+    if not is_camera_open():
         subprocess.Popen(["explorer", "microsoft.windows.camera:"])
         print("  [CAMARA] Abriendo")
     else:
@@ -374,6 +395,50 @@ def read_nvidia_gpu():
         return None
 
 
+# Reproducción multimedia (Spotify, etc.): opcional, requiere
+#   pip install winrt-Windows.Media.Control winrt-Windows.Foundation
+try:
+    import asyncio
+    from winrt.windows.media.control import (
+        GlobalSystemMediaTransportControlsSessionManager as _MediaManager)
+except Exception:
+    _MediaManager = None
+
+
+def is_media_playing():
+    """True si la sesión multimedia actual está reproduciendo, None si no se sabe"""
+    if _MediaManager is None:
+        return None
+
+    async def query():
+        mgr = await _MediaManager.request_async()
+        s = mgr.get_current_session()
+        if s is None:
+            return False
+        return int(s.get_playback_info().playback_status) == 4  # 4 = PLAYING
+
+    try:
+        return asyncio.run(query())
+    except Exception:
+        return None
+
+
+def read_button_states():
+    """Estado real de cada botón con toggle.
+
+    Las claves son el comando sin el prefijo "CMD:"; la ESP actualiza todos
+    los botones cuyo comando coincida. Discord no se puede consultar, así
+    que ese botón sigue cambiando solo al pulsarlo.
+    """
+    states = {
+        "MIC_TOGGLE":    get_mute(eCapture),
+        "VOL_MUTE":      get_mute(eRender),
+        "CAMERA_TOGGLE": is_camera_open(),
+        "SPOTIFY_PLAY":  is_media_playing(),
+    }
+    return {k: v for k, v in states.items() if v is not None}
+
+
 def stats_loop(get_serial):
     """Hilo que envía 'STAT:...' a la ESP32 cada STATS_INTERVAL segundos"""
     import pythoncom
@@ -429,6 +494,12 @@ def stats_loop(get_serial):
                               vramu=vused / 1024, vramt=vtotal / 1024)
 
         line = "STAT:" + ",".join(f"{k}={v:.1f}" for k, v in fields.items()) + "\n"
+
+        # Estado real de los botones con toggle (la ESP los redibuja si cambian)
+        states = read_button_states()
+        if states:
+            line += "STATE:" + ",".join(f"{k}={int(v)}" for k, v in states.items()) + "\n"
+
         ser = get_serial()
         if ser is None:
             continue
@@ -441,7 +512,7 @@ def stats_loop(get_serial):
 # ============================================================
 #  BUSCAR PUERTO ESP32
 # ============================================================
-def find_esp32_port():
+def find_esp32_port(verbose=True):
     ports = serial.tools.list_ports.comports()
     for port in ports:
         if port.vid == 0x303A:  # Espressif (USB nativo de la ESP32-S3)
@@ -450,7 +521,7 @@ def find_esp32_port():
         desc = port.description.lower()
         if any(x in desc for x in ["cp210", "ch340", "ch9102", "usb serial", "uart", "cdc"]):
             return port.device
-    if ports:
+    if ports and verbose:
         print("Puertos disponibles:")
         for p in ports:
             print(f"  {p.device} — {p.description}")
@@ -460,24 +531,69 @@ def find_esp32_port():
 # ============================================================
 #  BUCLE PRINCIPAL
 # ============================================================
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "streamdeck.log")
+_instance_mutex = None  # se guarda para que el mutex viva mientras corre el proceso
+
+
+def setup_background_mode():
+    """Con pythonw (arranque automático) no hay consola: la salida va a un log"""
+    if sys.stdout is not None:
+        return False
+    log = open(LOG_FILE, "w", encoding="utf-8", buffering=1)
+    sys.stdout = sys.stderr = log
+    return True
+
+
+def ensure_single_instance():
+    """Evita dos bridges peleándose por el mismo puerto COM"""
+    global _instance_mutex
+    import win32event
+    import winerror
+    _instance_mutex = win32event.CreateMutex(None, False, "Local\\CoolDeckBridge")
+    if win32api.GetLastError() == winerror.ERROR_ALREADY_EXISTS:
+        print("Ya hay un CoolDeck bridge en marcha (¿arranque automático?). "
+              "Ciérralo desde el Administrador de tareas (pythonw.exe) si quieres usar este.")
+        return False
+    return True
+
+
+def open_esp32(port_hint, interactive):
+    """Abre el puerto de la ESP32, esperando a que aparezca si no está conectada"""
+    port = find_esp32_port() or port_hint
+    if port is None and interactive:
+        port = input("\nNo se encontró la ESP32. Introduce el puerto (ej: COM4) "
+                     "o pulsa Enter para esperar a que se conecte: ").strip() or None
+
+    warned = False
+    while True:
+        if port:
+            try:
+                print(f"\nConectando a {port} a 115200 baudios...")
+                ser = serial.Serial(port, 115200, timeout=1)
+                time.sleep(2)
+                print(f"Conectado a {port} ✓")
+                return ser, port
+            except serial.SerialException as e:
+                print(f"No se pudo abrir {port}: {e}")
+        if not warned:
+            print("Esperando a que se conecte la ESP32 (reintento cada 3 s)...")
+            warned = True
+        time.sleep(3)
+        port = find_esp32_port(verbose=False) or port
+
+
 def main():
+    background = setup_background_mode()
     print("=" * 45)
     print("       CoolDeck — Python Bridge")
     print("=" * 45)
+    if not ensure_single_instance():
+        if not background:
+            time.sleep(5)
+        sys.exit(0)
 
-    port = find_esp32_port()
-    if port is None:
-        port = input("\nNo se encontró la ESP32. Introduce el puerto (ej: COM4): ").strip()
-
-    print(f"\nConectando a {port} a 115200 baudios...")
-    try:
-        ser = serial.Serial(port, 115200, timeout=1)
-        time.sleep(2)
-        print(f"Conectado a {port} ✓")
-        print("Esperando comandos...\n")
-    except serial.SerialException as e:
-        print(f"Error al abrir {port}: {e}")
-        sys.exit(1)
+    ser, port = open_esp32(None, interactive=not background)
+    print("Esperando comandos...\n")
 
     # El hilo de estadísticas lee siempre el puerto actual (cambia al reconectar)
     current = {"ser": ser}
@@ -511,7 +627,7 @@ def main():
             while True:
                 time.sleep(3)
                 try:
-                    new_port = find_esp32_port() or port
+                    new_port = find_esp32_port(verbose=False) or port
                     ser = serial.Serial(new_port, 115200, timeout=1)
                     port = new_port
                     current["ser"] = ser
